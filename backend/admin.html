@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admin Dashboard - AI History</title>
+    <link rel="icon" href="data:," />
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-900 text-white min-h-screen p-8">
+    <div class="max-w-6xl mx-auto">
+      <header class="flex justify-between items-center mb-8">
+        <h1 class="text-3xl font-bold text-blue-400">Admin Dashboard</h1>
+        <div
+          id="agentInfo"
+          class="bg-gray-800 px-4 py-2 rounded-lg border border-gray-700 text-sm"
+        >
+          <span class="text-gray-400">Agents:</span> Whisper (base), LLaMA 3,
+          gTTS
+        </div>
+      </header>
+
+      <div
+        class="bg-gray-800 rounded-xl shadow-xl overflow-hidden border border-gray-700"
+      >
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="bg-gray-700/50">
+              <th class="p-4 text-xs font-semibold text-gray-400 uppercase">
+                Time
+              </th>
+              <th class="p-4 text-xs font-semibold text-gray-400 uppercase">
+                User Input
+              </th>
+              <th class="p-4 text-xs font-semibold text-gray-400 uppercase">
+                Agent Reply
+              </th>
+              <th class="p-4 text-xs font-semibold text-gray-400 uppercase">
+                Provenance
+              </th>
+              <th class="p-4 text-xs font-semibold text-gray-400 uppercase">
+                Audio
+              </th>
+            </tr>
+          </thead>
+          <tbody id="historyBody">
+            <!-- Loaded via JS -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      async function loadHistory() {
+        const token = prompt("Enter Admin Token:");
+        try {
+          const response = await fetch("/admin/history", {
+            headers: { "X-ADMIN-TOKEN": token },
+          });
+          if (!response.ok) throw new Error("Unauthorized");
+
+          const data = await response.json();
+          const body = document.getElementById("historyBody");
+
+          data.history.reverse().forEach((entry) => {
+            const row = document.createElement("tr");
+            row.className =
+              "border-t border-gray-700 hover:bg-gray-700/30 transition-colors";
+            row.innerHTML = `
+                        <td class="p-4 text-sm text-gray-400 whitespace-nowrap">${new Date(entry.timestamp).toLocaleString()}</td>
+                        <td class="p-4 text-sm text-gray-200">${entry.transcript}</td>
+                        <td class="p-4 text-sm text-blue-200">${entry.reply_text}</td>
+                        <td class="p-4 text-sm">
+                            <span class="px-2 py-1 bg-gray-900 rounded text-xs text-gray-400 block mb-1">STT: ${entry.provenance.stt}</span>
+                            <span class="px-2 py-1 bg-gray-900 rounded text-xs text-gray-400 block">LLM: ${entry.provenance.llm}</span>
+                        </td>
+                        <td class="p-4">
+                            <audio src="${entry.reply_audio_url}" controls class="h-8 w-48"></audio>
+                        </td>
+                    `;
+            body.appendChild(row);
+          });
+        } catch (err) {
+          alert(err.message);
+          window.location.href = "/";
+        }
+      }
+      loadHistory();
+    </script>
+  </body>
+</html>
