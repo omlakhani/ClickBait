@@ -72,13 +72,26 @@ async def voice_chat(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+<<<<<<< HEAD
     try:
         # 1. Transcribe
         transcript = transcribe(input_path)
+=======
+    # Call the ai pipeline script (synchronous)
+    # Note: we run pipeline.py which outputs response.wav in ai folder
+    pipeline_script = os.path.join(AI_DIR, "pipeline.py")
+    if not os.path.exists(pipeline_script):
+        return {
+            "error": "AI pipeline script not found",
+            "expected_path": pipeline_script,
+        }
+    proc = subprocess.run(["python", pipeline_script, file_path], capture_output=True, text=True)
+>>>>>>> 29dcfb2e96b576d0ca4cec04e5eac1a6fe0c7947
 
         # 2. Query LLaMA
         reply_text = query_llama(transcript)
 
+<<<<<<< HEAD
         # 3. Generate Speech
         output_filename = f"{uid}_response.wav"
         output_path = os.path.join(RESPONSES_DIR, output_filename)
@@ -131,3 +144,17 @@ async def get_history(x_admin_token: Optional[str] = Header(None)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+=======
+    # Assume ai/pipeline.py produced ai/response.wav
+    audio_out = os.path.join(AI_DIR, "response.wav")
+    if not os.path.exists(audio_out):
+        return {
+            "error": "AI pipeline did not produce response.wav",
+            "expected_path": audio_out,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    # Read JSON-like output from pipeline or we can return static
+    # For now, we'll return the transcript & reply captured by pipeline stdout
+    return FileResponse(audio_out, media_type="audio/wav", filename="response.wav")
+>>>>>>> 29dcfb2e96b576d0ca4cec04e5eac1a6fe0c7947
