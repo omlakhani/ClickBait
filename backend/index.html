@@ -141,20 +141,27 @@
         formData.append("file", blob, "input.webm");
 
         try {
-          const response = await fetch("/api/voice-chat", {
+          const response = await fetch("/upload", {
             method: "POST",
             body: formData,
           });
-          const data = await response.json();
-
-          if (data.error) throw new Error(data.error);
+          
+          if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+          
+          // The /upload endpoint returns a FileResponse (audio/wav)
+          // Metadata is in headers
+          const transcript = response.headers.get("X-Transcript") || "No transcript";
+          const replyTextVal = response.headers.get("X-Reply") || "No reply";
+          
+          const audioBlob = await response.blob();
+          const audioUrl = URL.createObjectURL(audioBlob);
 
           transcriptSection.classList.remove("hidden");
-          transcriptText.textContent = data.transcript;
+          transcriptText.textContent = transcript;
 
           replySection.classList.remove("hidden");
-          replyText.textContent = data.reply_text;
-          replyAudio.src = data.reply_audio_url;
+          replyText.textContent = replyTextVal;
+          replyAudio.src = audioUrl;
           replyAudio.play();
 
           status.textContent = "Done";

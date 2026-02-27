@@ -17,5 +17,9 @@
   "bugs": {
     "url": "https://github.com/omlakhani/ClickBait/issues"
   },
-  "homepage": "https://github.com/omlakhani/ClickBait#readme"
+  "homepage": "https://github.com/omlakhani/ClickBait#readme",
+  "dependencies": {
+    "@tailwindcss/vite": "^4.2.1",
+    "tailwindcss": "^4.2.1"
+  }
 }

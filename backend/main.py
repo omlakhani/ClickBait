@@ -11,6 +11,7 @@ from datetime import datetime
 import urllib.request
 import urllib.error
 import urllib.parse
+from openai import OpenAI
 
 app = FastAPI()
 API_VERSION = "v2"
@@ -97,6 +98,10 @@ _SITE_SEARCH_TEMPLATES: dict[str, str] = {
     "spotify": "https://open.spotify.com/search/{q}",
 }
 
+openai_client = None
+if os.getenv("OPENAI_API_KEY"):
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 def _safe_http_url(url: str) -> str | None:
     u = (url or "").strip()
     if not u:
@@ -119,24 +124,29 @@ def _extract_entities(text: str) -> dict:
     query = None
 
     # Natural language: "play shape of you on youtube" / "search headphones on amazon".
+    # Improved regex to handle various phrase structures
     sqm = re.search(
-        r"\b(?:play|search|find|look\s*up)\s+(.+?)\s+on\s+([a-z0-9.-]+)\b",
+        r"\b(?:play|search|find|look\s*up|show|open)\s+(.+?)\s+(?:on|in|using)\s+([a-z0-9.-]+)\b",
         low,
         flags=re.IGNORECASE,
     )
     if sqm:
         query = sqm.group(1).strip(" \t\r\n\"'.,")
         site = sqm.group(2).strip(" \t\r\n\"'.,")
+    
+    # Handle "open <site>" separately if not caught above
+    if not site:
+        os_match = re.search(r"\b(?:open|go\s+to|visit)\s+([a-z0-9.-]+)\b", low)
+        if os_match:
+            site = os_match.group(1).strip(" \t\r\n\"'.,")
+    
+    m = re.search(r"\bhttps?://[^\s]+", t)
+    if m:
+        url = m.group(0)
     else:
-        # Natural language: "open amazon website" / "go to youtube".
-        # Capture the token after open/go to/visit.
-        nm = re.search(r"\b(?:open|visit|go\s+to)\s+([a-z0-9.-]+)", low)
-        if nm:
-            cand = nm.group(1).strip(" .,")
-            if cand:
-                url = cand
+        # Fallback for explicit domains
         m2 = re.search(r"\b([a-z0-9-]+(\.[a-z0-9-]+)+)(/[^\s]*)?\b", t, flags=re.IGNORECASE)
-        if m2 and any(k in low for k in ["open", "go to", "visit", "website", "site"]):
+        if m2:
             url = m2.group(0)
 
     date = None
@@ -144,24 +154,37 @@ def _extract_entities(text: str) -> dict:
     tz = None
     reason = None
 
+    # Improved date extraction (handles "tomorrow", "today", "YYYY-MM-DD")
     dm = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", t)
     if dm:
         date = dm.group(1)
+    elif "tomorrow" in low:
+        from datetime import timedelta
+        date = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+    elif "today" in low:
+        date = datetime.utcnow().strftime("%Y-%m-%d")
 
+    # Improved time extraction (handles HH:MM, H am/pm)
     tm = re.search(r"\b(\d{1,2}:\d{2})\b", t)
     if tm:
         time = tm.group(1)
     else:
         tm2 = re.search(r"\b(\d{1,2})\s*(am|pm)\b", low)
         if tm2:
-            time = f"{tm2.group(1)}{tm2.group(2)}"
+            hour = int(tm2.group(1))
+            if tm2.group(2) == "pm" and hour < 12:
+                hour += 12
+            elif tm2.group(2) == "am" and hour == 12:
+                hour = 0
+            time = f"{hour:02d}:00"
 
     tzm = re.search(r"\b(ist|pst|est|cst|mst|utc|gmt)\b", low)
     if tzm:
         tz = tzm.group(1).upper()
 
-    rm = re.search(r"\bfor\s+(.+)$", t, flags=re.IGNORECASE)
-    if rm and any(k in low for k in ["appointment", "book", "booking", "schedule"]):
+    # Improved reason extraction
+    rm = re.search(r"\b(?:for|reason|about|task|named|called)\s+(.+)$", t, flags=re.IGNORECASE)
+    if rm and any(k in low for k in ["appointment", "book", "booking", "schedule", "meeting", "task", "calendar"]):
         reason = rm.group(1).strip()[:120]
 
     return {
@@ -189,7 +212,7 @@ def _detect_intent(text: str) -> tuple[str, float]:
         if re.search(r"\b(?:open|visit|go\s+to)\s+[a-z0-9.-]+", t):
             return "open_url", 0.75
 
-    if any(k in t for k in ["book", "booking", "schedule", "appointment"]):
+    if any(k in t for k in ["book", "booking", "schedule", "appointment", "add task", "create task", "calendar"]):
         return "book_appointment", 0.85
 
     if any(k in t for k in ["price", "pricing", "cost", "plan"]):
@@ -203,6 +226,9 @@ def _detect_intent(text: str) -> tuple[str, float]:
 
     if any(k in t for k in ["angry", "frustrated", "upset", "bad service"]):
         return "complaint", 0.75
+
+    if any(k in t for k in ["date", "time", "day is it", "what time", "what date"]):
+        return "get_date_time", 0.9
 
     return "general_help", 0.6
 
@@ -276,10 +302,36 @@ def _generate_response(text: str, history: list[dict[str, str]], state: dict) ->
                 "Sure—what date/time should I schedule it for?",
             ]
         else:
-            action = {"type": "BOOK_APPOINTMENT", "details": merged, "confirmation_required": False}
+            # Construct Google Calendar URL
+            # Format: https://www.google.com/calendar/render?action=TEMPLATE&text=Appointment&details=Reason&dates=YYYYMMDDTHHMMSSZ/YYYYMMDDTHHMMSSZ
+            # For demo, we use a simplified version
+            title = urllib.parse.quote(merged.get("reason") or "New Task")
+            
+            # Use current date if not specified
+            date_val = merged.get("date") or datetime.now().strftime("%Y-%m-%d")
+            time_val = merged.get("time") or "09:00"
+            
+            # Format date for Google Calendar: YYYYMMDDTHHMMSSZ
+            # We'll assume a 1-hour duration for simplicity
+            date_clean = date_val.replace("-", "")
+            time_clean = time_val.replace(":", "")
+            if len(time_clean) == 4: time_clean += "00"
+            
+            start_dt = f"{date_clean}T{time_clean}"
+            # Add 1 hour for end time (very simplified)
+            try:
+                h = int(time_clean[:2])
+                end_h = (h + 1) % 24
+                end_dt = f"{date_clean}T{end_h:02d}{time_clean[2:]}"
+            except:
+                end_dt = start_dt
+
+            gcal_url = f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={title}&dates={start_dt}/{end_dt}"
+            
+            action = {"type": "OPEN_URL", "url": gcal_url, "confirmation_required": True}
             candidates = [
-                f"Booked. I scheduled it for {merged.get('date')} at {merged.get('time')}.",
-                f"Done—your appointment is set for {merged.get('date')} {merged.get('time')}.",
+                f"I've set up a Google Calendar task: '{merged.get('reason')}'. Should I open it?",
+                f"Ready to add your task to Google Calendar. Open it now?",
             ]
 
     elif intent == "pricing":
@@ -306,6 +358,15 @@ def _generate_response(text: str, history: list[dict[str, str]], state: dict) ->
             "That sounds frustrating. Tell me what happened and what you want as the resolution.",
         ]
 
+    elif intent == "get_date_time":
+        now = datetime.now()
+        date_str = now.strftime("%A, %B %d, %Y")
+        time_str = now.strftime("%I:%M %p")
+        candidates = [
+            f"Today is {date_str}. The current time is {time_str}.",
+            f"It's {time_str} on {date_str}.",
+        ]
+
     else:
         candidates = [
             "Got it. What’s the main goal you want to achieve, and what’s stopping you right now?",
@@ -325,6 +386,37 @@ def _generate_response(text: str, history: list[dict[str, str]], state: dict) ->
         "action": action,
         "state": {"pending_booking": state.get("pending_booking")},
     }
+
+def _get_openai_reply(text: str, history: list[dict[str, str]], analysis: dict) -> str | None:
+    if not openai_client:
+        return None
+    
+    try:
+        now = datetime.now()
+        current_context = f"Current Date: {now.strftime('%A, %B %d, %Y')}. Current Time: {now.strftime('%I:%M %p')}."
+        messages = [
+            {"role": "system", "content": f"You are a highly personalized AI assistant. {current_context} You remember everything from the conversation. You are smart, creative, and can solve riddles. You can help the user add tasks or appointments to their Google Calendar. Use the user's name if known. Be concise but warm."}
+        ]
+        
+        # Add history
+        for msg in history[-10:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Add current context
+        context_info = f"Current Intent: {analysis.get('intent')}. Entities: {json.dumps(analysis.get('entities'))}"
+        messages.append({"role": "system", "content": f"Context for this turn: {context_info}"})
+        messages.append({"role": "user", "content": text})
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=200
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"OpenAI Error: {e}")
+        return None
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
@@ -371,7 +463,9 @@ def _ollama_chat_generate(
         "You are a helpful voice assistant. "
         "You must follow the provided intent/entities/action. "
         "Do not invent actions or URLs. "
-        "Return a JSON object with keys: reply (string), candidates (array of 2-4 strings)."
+        "Return a JSON object with keys: reply (string), candidates (array of 2-4 strings). "
+        "If the user asks a riddle, solve it creatively. "
+        "Remember the conversation history for context."
     )
 
     user = {
@@ -454,19 +548,25 @@ async def chat(payload: dict):
     history = _CHAT_SESSIONS.get(session_id, [])
     state = _SESSION_STATE.get(session_id, {})
     enriched = _generate_response(text, history=history, state=state)
-    reply = str(enriched.get("reply") or "")
-
-    llm_reply, llm_candidates = _ollama_chat_generate(
-        text=text,
-        history=history,
-        analysis=enriched.get("analysis") or {},
-        action=enriched.get("action"),
-        fallback_candidates=enriched.get("candidates") or [],
-    )
-    if llm_reply:
-        reply = llm_reply
-    if llm_candidates:
-        enriched["candidates"] = llm_candidates
+    
+    # Try OpenAI first for personalized response
+    ai_reply = _get_openai_reply(text, history, enriched.get("analysis", {}))
+    if ai_reply:
+        reply = ai_reply
+    else:
+        # Fallback to LLaMA or Heuristics
+        reply = str(enriched.get("reply") or "")
+        llm_reply, llm_candidates = _ollama_chat_generate(
+            text=text,
+            history=history,
+            analysis=enriched.get("analysis") or {},
+            action=enriched.get("action"),
+            fallback_candidates=enriched.get("candidates") or [],
+        )
+        if llm_reply:
+            reply = llm_reply
+        if llm_candidates:
+            enriched["candidates"] = llm_candidates
 
     history = history + [
         {"role": "user", "content": text},
@@ -566,48 +666,72 @@ async def health():
     return {"status": "ok"}
 
 @app.post("/upload")
-async def upload_audio(audio: UploadFile = File(None), file: UploadFile = File(None)):
-    incoming = audio or file
-    if incoming is None:
-        return {"error": "No audio file provided. Use multipart field name 'audio'."}
-
-    # Save the incoming file
-    uid = str(uuid.uuid4())[:8]
-    filename = incoming.filename or "audio.wav"
-    file_path = os.path.join(UPLOAD_DIR, f"{uid}_{filename}")
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(incoming.file, f)
-
-<<<<<<< HEAD
+async def upload_audio(
+    audio: UploadFile = File(None), 
+    file: UploadFile = File(None),
+    session_id: str = "default"
+):
     try:
-        # 1. Transcribe
-        transcript = transcribe(input_path)
-=======
-    # Call the ai pipeline script (synchronous)
-    # Note: we run pipeline.py which outputs response.wav in ai folder
-    pipeline_script = os.path.join(AI_DIR, "pipeline.py")
-    proc = subprocess.run([sys.executable, pipeline_script, file_path], capture_output=True, text=True)
+        incoming = audio or file
+        if incoming is None:
+            print("DEBUG: No audio file provided in request")
+            return {"error": "No audio file provided. Use multipart field name 'audio' or 'file'."}
 
-        # 2. Query LLaMA
-        reply_text = query_llama(transcript)
+        # Save the incoming file
+        uid = str(uuid.uuid4())[:8]
+        filename = incoming.filename or "audio.wav"
+        file_path = os.path.join(UPLOAD_DIR, f"{uid}_{filename}")
+        print(f"DEBUG: Saving uploaded file to {file_path}")
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(incoming.file, f)
 
-    # Assume ai/pipeline.py produced ai/response.wav (+ ai/response.json)
-    audio_out = os.path.join(AI_DIR, "response.wav")
-    meta_path = os.path.join(AI_DIR, "response.json")
+        # Ensure ffmpeg is in PATH for Whisper
+        env = os.environ.copy()
+        ffmpeg_bin = r"C:\Users\Admin\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.WinGet.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-essentials_build\bin"
+        if ffmpeg_bin not in env.get("PATH", ""):
+            env["PATH"] = ffmpeg_bin + os.pathsep + env.get("PATH", "")
 
-    transcript = ""
-    reply = ""
-    try:
-        if os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            transcript = (meta.get("transcript") or "").strip()
-            reply = (meta.get("reply") or "").strip()
-    except Exception:
-        pass
+        # Call the ai pipeline script (synchronous)
+        pipeline_script = os.path.join(AI_DIR, "pipeline.py")
+        
+        print(f"DEBUG: Running pipeline for session {session_id} with file {file_path}")
+        # Pass session_id to pipeline for memory recovery
+        proc = subprocess.run([sys.executable, pipeline_script, file_path, session_id], capture_output=True, text=True, env=env)
 
-    headers = {
-        "X-Transcript": transcript[:800],
-        "X-Reply": reply[:800],
-    }
-    return FileResponse(audio_out, media_type="audio/wav", filename="response.wav", headers=headers)
+        if proc.returncode != 0:
+            print(f"ERROR: Pipeline failed with code {proc.returncode}")
+            print(f"STDOUT: {proc.stdout}")
+            print(f"STDERR: {proc.stderr}")
+            return {"error": "AI pipeline failed", "stdout": proc.stdout, "stderr": proc.stderr}
+
+        # Assume ai/pipeline.py produced ai/response.wav (+ ai/response.json)
+        audio_out = os.path.join(AI_DIR, "response.wav")
+        meta_path = os.path.join(AI_DIR, "response.json")
+
+        if not os.path.exists(audio_out):
+            print(f"ERROR: Output audio file not found at {audio_out}")
+            return {"error": "Output audio file not found"}
+
+        transcript = ""
+        reply = ""
+        try:
+            if os.path.exists(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                transcript = (meta.get("transcript") or "").strip()
+                reply = (meta.get("reply") or "").strip()
+        except Exception as e:
+            print(f"DEBUG: Error reading meta JSON: {e}")
+
+        headers = {
+            "X-Transcript": transcript[:800],
+            "X-Reply": reply[:800],
+            "Access-Control-Expose-Headers": "X-Transcript, X-Reply"
+        }
+        return FileResponse(audio_out, media_type="audio/wav", filename="response.wav", headers=headers)
+    except Exception as e:
+        import traceback
+        error_msg = f"Unexpected backend error: {str(e)}"
+        print(f"ERROR: {error_msg}")
+        print(traceback.format_exc())
+        return {"error": error_msg, "traceback": traceback.format_exc()}

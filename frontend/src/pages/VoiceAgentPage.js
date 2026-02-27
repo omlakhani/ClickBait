@@ -84,9 +84,15 @@ export default function VoiceAgentPage() {
       if (finalT && !autoSentRef.current) {
         autoSentRef.current = true;
         setTranscript(finalT);
-        setTimeout(() => {
-          sendToBackend(finalT, { auto: true });
-        }, 0);
+        // Execute the async call in a safe wrapper
+        const triggerBackend = async () => {
+          try {
+            await sendToBackend(finalT, { auto: true });
+          } catch (err) {
+            console.error('Async send error:', err);
+          }
+        };
+        triggerBackend();
       }
     };
 
