@@ -1,128 +1,123 @@
-<<<<<<< HEAD
-from __future__ import annotations
-
+import json
 import os
 import sys
-from typing import Optional
+import traceback
 
-# Allow running as: python ai/pipeline.py
-if __package__ is None or __package__ == "":
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from ai.transcribe import transcribe
-from ai.llama_query import query_llama
-from ai.tts_generate import generate_speech
+import whisper
+from ollama import Client
 
 
-def _require_imports() -> Optional[str]:
+def _safe_header_text(s: str, limit: int = 800) -> str:
+    s = (s or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > limit:
+        return s[: limit - 3] + "..."
+    return s
+
+
+def process_audio(file_path: str) -> dict:
+    """End-to-end local voice pipeline:
+
+    input audio -> Whisper STT -> Ollama (LLaMA3) -> Coqui TTS -> response.wav
+
+    Side effects:
+    - writes ai/response.wav
+    - writes ai/response.json
+    """
+    out_dir = os.path.dirname(__file__)
+    output_wav = os.path.join(out_dir, "response.wav")
+    output_json = os.path.join(out_dir, "response.json")
+
+    result_payload: dict = {
+        "ok": False,
+        "input_audio": file_path,
+        "transcript": "",
+        "reply": "",
+        "errors": [],
+        "tts_model": "",
+    }
+
     try:
-        import whisper  # noqa: F401
-    except Exception:
-        return (
-            "Missing dependency: openai-whisper. Install with: "
-            "python -m pip install openai-whisper"
+        # 1) Whisper STT (local)
+        stt_model = whisper.load_model("base")
+        stt = stt_model.transcribe(file_path)
+        transcript = (stt.get("text") or "").strip()
+        result_payload["transcript"] = transcript
+
+        # 2) Ollama LLaMA 3 (local)
+        client = Client(host="http://localhost:11434")
+        llm = client.chat(
+            model="llama3",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful, concise customer support agent.",
+                },
+                {
+                    "role": "user",
+                    "content": transcript or "(No speech detected)",
+                },
+            ],
         )
+        reply = ((llm.get("message") or {}).get("content") or "").strip()
+        result_payload["reply"] = reply
 
-    try:
-        from gtts import gTTS  # noqa: F401
-    except Exception:
-        return (
-            "Missing dependency: gTTS. Install with: "
-            "python -m pip install gTTS"
-        )
+        # 3) Coqui TTS (local)
+        # Requires: pip install TTS
+        try:
+            from TTS.api import TTS  # type: ignore
 
-    try:
-        import requests  # noqa: F401
-    except Exception:
-        return "Missing dependency: requests. Install with: python -m pip install requests"
+            # A solid English model; change later for multilingual.
+            # First run will download the model locally.
+            tts_model_name = "tts_models/en/ljspeech/tacotron2-DDC"
+            result_payload["tts_model"] = tts_model_name
 
-    return None
+            tts = TTS(model_name=tts_model_name, progress_bar=False)
+            tts.tts_to_file(text=reply or "", file_path=output_wav)
+        except Exception as e:
+            # If Coqui fails, we still produce a wav so the backend can respond.
+            result_payload["errors"].append(f"TTS failed: {type(e).__name__}: {e}")
+            import shutil
 
+            shutil.copy(file_path, output_wav)
 
-def _preflight(input_path: str) -> None:
-    print(f"Python: {sys.executable}")
+        result_payload["ok"] = True
 
-    missing = _require_imports()
-    if missing:
-        raise RuntimeError(missing)
-
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(
-            f"Audio file not found: {input_path}. Place input.wav in the project root."
-        )
-    if os.path.getsize(input_path) == 0:
-        raise ValueError("Empty audio")
-
-    # Optional Ollama connectivity check (query_llama will still handle failures)
-    try:
-        import requests
-
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        if r.status_code != 200:
-            raise RuntimeError()
-    except Exception:
-        raise RuntimeError(
-            "LLaMA not responding. Ensure Ollama is running at http://localhost:11434 "
-            "and the model is available (e.g. ollama run llama3)."
-        )
-
-
-def main() -> int:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(base_dir)
-
-    input_path = os.path.join(project_root, "input.wav")
-    output_path = os.path.join(project_root, "response.wav")
-
-    try:
-        _preflight(input_path)
-
-        print("Transcribing...")
-        transcript = transcribe(input_path)
-
-        print("Sending to LLaMA...")
-        reply = query_llama(transcript)
-
-        print("Generating speech...")
-        generate_speech(reply, output_path)
-
-        return 0
     except Exception as e:
-        print(f"Error: {e}")
-        return 1
-=======
-import os
-import sys
-import wave
+        result_payload["errors"].append(f"Pipeline failed: {type(e).__name__}: {e}")
+        result_payload["errors"].append(traceback.format_exc())
 
+        # Last-resort output wav (copy input)
+        try:
+            import shutil
 
-def _write_silence_wav(path: str, duration_seconds: float = 0.5, sample_rate: int = 16000) -> None:
-    n_channels = 1
-    sampwidth = 2  # 16-bit PCM
-    n_frames = int(duration_seconds * sample_rate)
-    silence = (b"\x00\x00") * n_frames
+            shutil.copy(file_path, output_wav)
+        except Exception:
+            pass
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(n_channels)
-        wf.setsampwidth(sampwidth)
-        wf.setframerate(sample_rate)
-        wf.writeframes(silence)
+    # Always write debug JSON for the backend/dashboard
+    try:
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-
-def main() -> int:
-    # Usage: python pipeline.py <input_audio_path>
-    _ = sys.argv[1] if len(sys.argv) > 1 else None
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    response_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "response.wav")
-
-    _write_silence_wav(response_path)
-    print("ok")
-    print(f"response_wav={response_path}")
-    return 0
->>>>>>> 29dcfb2e96b576d0ca4cec04e5eac1a6fe0c7947
+    # Also print a single-line summary (captured by backend if needed)
+    print(
+        json.dumps(
+            {
+                "ok": result_payload["ok"],
+                "transcript": _safe_header_text(result_payload.get("transcript", "")),
+                "reply": _safe_header_text(result_payload.get("reply", "")),
+                "errors": result_payload.get("errors", [])[:1],
+            },
+            ensure_ascii=False,
+        )
+    )
+    return result_payload
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if len(sys.argv) <= 1:
+        print("No audio file provided")
+        raise SystemExit(2)
+    process_audio(sys.argv[1])
