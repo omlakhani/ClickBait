@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Mic, Send, Square } from 'lucide-react';
+import { Mic, Send, Square, Settings } from 'lucide-react';
 import { useChat } from '../state/ChatContext';
 
 const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001').replace(/\/$/, '');
@@ -10,6 +10,10 @@ export default function VoiceAgentPage() {
   const [status, setStatus] = useState('idle');
   const [transcript, setTranscript] = useState('');
   const [reply, setReply] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
   const [analysis, setAnalysis] = useState(null);
   const [candidates, setCandidates] = useState([]);
   const [action, setAction] = useState(null);
@@ -65,7 +69,7 @@ export default function VoiceAgentPage() {
         } catch {
           // ignore
         }
-      }, 900);
+      }, 500);
     };
 
     rec.onerror = (e) => {
@@ -115,38 +119,121 @@ export default function VoiceAgentPage() {
     }
   };
 
-  const startListening = async () => {
-    setError('');
-    setReply('');
-    setTranscript('');
-    setAnalysis(null);
-    setCandidates([]);
-    setAction(null);
-    finalTextRef.current = '';
-    autoSentRef.current = false;
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      audioChunksRef.current = [];
 
-    if (!isSpeechApiAvailable) {
-      setError('SpeechRecognition is not supported in this browser. Try Chrome/Edge.');
-      return;
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        await uploadAudio(audioBlob);
+      };
+
+      mediaRecorderRef.current.start();
+      setIsRecording(true);
+      setStatus('listening');
+    } catch (err) {
+      setError('Microphone access denied or not available.');
     }
-    recognitionRef.current?.start();
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      setStatus('thinking');
+      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+    }
+  };
+
+  const uploadAudio = async (blob) => {
+    setIsProcessing(true);
+    setStatus('thinking');
+    const formData = new FormData();
+    formData.append('file', blob, 'recording.webm');
+    formData.append('session_id', sessionId);
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) throw new Error(`Server error: ${res.status}`);
+
+      const transcript = res.headers.get('X-Transcript') || '';
+      const replyText = res.headers.get('X-Reply') || '';
+      
+      setTranscript(transcript);
+      setReply(replyText);
+      setIsProcessing(false);
+      setStatus('idle');
+      
+      const audioBlob = await res.blob();
+      if (audioBlob.size > 0) {
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio();
+        audio.src = audioUrl;
+        audio.type = "audio/wav";
+        
+        audio.oncanplaythrough = () => {
+          audio.play()
+            .then(() => console.log("Audio playing..."))
+            .catch(e => {
+              console.error("Audio play blocked/failed:", e);
+              setError("Click to enable audio playback.");
+            });
+        };
+
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+        };
+
+        audio.onerror = (e) => {
+          console.error("Audio loading error:", e);
+          setError("Generated audio failed to load.");
+          URL.revokeObjectURL(audioUrl);
+        };
+      }
+    } catch (err) {
+      setIsProcessing(false);
+      setStatus('idle');
+      setError('Failed to process voice input.');
+    }
+  };
+
+  const startListening = async () => {
+    await startRecording();
   };
 
   const stopListening = () => {
-    try {
-      recognitionRef.current?.stop();
-    } catch {
-      // ignore
-    }
+    stopRecording();
+  };
+
+  const cleanTranscript = (text) => {
+    return text
+      .replace(/\b(i need to|can you|please|i want to|could you|help me to|i would like to|um|uh|ah)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   };
 
   const sendToBackend = async (textArg, opts) => {
-    const text = ((typeof textArg === 'string' ? textArg : transcript) || '').trim();
+    const rawText = ((typeof textArg === 'string' ? textArg : transcript) || '').trim();
+    const text = cleanTranscript(rawText);
+    
     if (!text) {
       setError('Say something first, then try again.');
       return;
     }
 
+    setIsProcessing(true);
     setStatus('thinking');
     setError('');
 
@@ -166,6 +253,7 @@ export default function VoiceAgentPage() {
       }
 
       const data = await res.json();
+      setIsProcessing(false);
       const r = (data?.reply || '').toString();
       setReply(r);
       setAnalysis(data?.analysis || null);
@@ -186,8 +274,9 @@ export default function VoiceAgentPage() {
         }
       }
     } catch (e) {
+      setIsProcessing(false);
       setStatus('idle');
-      setError('Failed to reach backend. Is it running on 127.0.0.1:8000?');
+      setError('Failed to reach backend. Is it running on 127.0.0.1:8001?');
     }
   };
 
@@ -214,9 +303,20 @@ export default function VoiceAgentPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <div className="text-3xl font-black tracking-tight">Voice Agent</div>
-        <div className="text-sm text-gray-400 font-medium">Browser STT/TTS + backend support agent (no heavy downloads)</div>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-3xl font-black tracking-tight">Voice Agent</div>
+          <div className="text-sm text-gray-400 font-medium">Whisper + GPT-4o powered personal assistant</div>
+        </div>
+        <a 
+          href={BACKEND_URL} 
+          target="_blank" 
+          rel="noopener noreferrer"
+          className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl border border-white/10 transition-all font-semibold"
+        >
+          <Settings size={18} />
+          Admin Panel
+        </a>
       </div>
 
       <div className="rounded-2xl bg-white/5 border border-white/5 p-5">
@@ -256,20 +356,21 @@ export default function VoiceAgentPage() {
             placeholder="Type here (e.g. open amazon website, book appointment...)"
             className="flex-1 min-w-[240px] bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white placeholder:text-gray-500 outline-none focus:border-white/20"
           />
-          <button
-            onClick={() => {
-              const msg = (textDraft || '').trim();
-              if (!msg) return;
-              setTranscript(msg);
-              setTextDraft('');
-              sendToBackend(msg);
-            }}
-            disabled={status !== 'idle'}
-            className="bg-white hover:bg-blue-50 disabled:bg-gray-200 text-blue-700 font-bold py-3 px-5 rounded-2xl shadow-xl transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed active:scale-95"
-            type="button"
-          >
-            Send Text
-          </button>
+            <button
+              onClick={() => {
+                const msg = (textDraft || '').trim();
+                if (!msg) return;
+                setTranscript(msg);
+                setTextDraft('');
+                sendToBackend(msg);
+              }}
+              disabled={status !== 'idle' || isProcessing}
+              className="bg-white hover:bg-blue-50 disabled:bg-gray-200 text-blue-700 font-bold py-3 px-6 rounded-2xl shadow-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed active:scale-95 flex items-center gap-2"
+              type="button"
+            >
+              {isProcessing ? <div className="w-4 h-4 border-2 border-blue-700 border-t-transparent rounded-full animate-spin"></div> : <Send size={18} />}
+              Send
+            </button>
         </div>
       </div>
 
@@ -371,10 +472,14 @@ export default function VoiceAgentPage() {
 
           <button
             onClick={() => sendToBackend()}
-            disabled={status !== 'idle'}
-            className="group bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 disabled:bg-gray-200 text-white font-bold py-3 px-5 rounded-2xl shadow-xl transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center active:scale-95"
+            disabled={status !== 'idle' || isProcessing}
+            className="group bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 disabled:from-gray-400 disabled:to-gray-500 text-white font-bold py-3 px-6 rounded-2xl shadow-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center active:scale-95"
           >
-            <Send className="mr-2" size={18} />
+            {isProcessing ? (
+              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2"></div>
+            ) : (
+              <Send className="mr-2" size={18} />
+            )}
             Ask Agent
           </button>
         </div>

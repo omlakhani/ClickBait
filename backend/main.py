@@ -186,6 +186,10 @@ def _extract_entities(text: str) -> dict:
     rm = re.search(r"\b(?:for|reason|about|task|named|called)\s+(.+)$", t, flags=re.IGNORECASE)
     if rm and any(k in low for k in ["appointment", "book", "booking", "schedule", "meeting", "task", "calendar"]):
         reason = rm.group(1).strip()[:120]
+    
+    # Transcription cleanup for filler words
+    t = re.sub(r"\b(i need to|can you|please|i want to|could you|help me to|i would like to|um|uh|ah)\b", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
 
     return {
         "url": url,
